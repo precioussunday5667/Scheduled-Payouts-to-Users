@@ -223,3 +223,242 @@
     )
   )
 )
+
+
+
+(define-constant ERR_BENEFICIARY_NOT_FOUND (err u202))
+(define-constant ERR_SCHEDULE_EXISTS (err u203))
+(define-constant ERR_INVALID_PARAMS (err u204))
+(define-constant ERR_CLIFF_NOT_REACHED (err u205))
+(define-constant ERR_NOTHING_TO_CLAIM (err u206))
+(define-constant ERR_SCHEDULE_REVOKED (err u207))
+
+(define-constant BLOCKS_PER_DAY u144)
+
+(define-data-var total-locked uint u0)
+(define-data-var total-schedules uint u0)
+
+(define-map vesting-schedules
+  { beneficiary: principal }
+  {
+    total-amount: uint,
+    start-block: uint,
+    cliff-duration-days: uint,
+    vesting-duration-days: uint,
+    claimed-amount: uint,
+    revoked: bool,
+    revoke-block: uint
+  }
+)
+
+(define-map schedule-metadata
+  { beneficiary: principal }
+  {
+    title: (string-ascii 50),
+    created-block: uint,
+    creator: principal
+  }
+)
+
+(define-read-only (get-contract-balance)
+  (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-total-locked)
+  (var-get total-locked)
+)
+
+(define-read-only (get-total-schedules)
+  (var-get total-schedules)
+)
+
+(define-read-only (get-vesting-schedule (beneficiary principal))
+  (map-get? vesting-schedules { beneficiary: beneficiary })
+)
+
+(define-read-only (get-schedule-metadata (beneficiary principal))
+  (map-get? schedule-metadata { beneficiary: beneficiary })
+)
+
+(define-read-only (calculate-vested-amount (beneficiary principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: beneficiary }) (err u0)))
+    (total-amount (get total-amount schedule))
+    (start-block (get start-block schedule))
+    (cliff-days (get cliff-duration-days schedule))
+    (vesting-days (get vesting-duration-days schedule))
+    (revoked (get revoked schedule))
+    (revoke-block (get revoke-block schedule))
+    (current-block (if revoked revoke-block stacks-block-height))
+    (cliff-end-block (+ start-block (* cliff-days BLOCKS_PER_DAY)))
+    (vesting-end-block (+ start-block (* vesting-days BLOCKS_PER_DAY)))
+  )
+    (if (< current-block cliff-end-block)
+      (ok u0)
+      (if (>= current-block vesting-end-block)
+        (ok total-amount)
+        (let (
+          (blocks-since-cliff (- current-block cliff-end-block))
+          (total-vesting-blocks (- vesting-end-block cliff-end-block))
+          (vested-amount (/ (* total-amount blocks-since-cliff) total-vesting-blocks))
+        )
+          (ok vested-amount)
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-claimable-amount (beneficiary principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: beneficiary }) (err u0)))
+    (vested-amount (unwrap! (calculate-vested-amount beneficiary) (err u0)))
+    (claimed-amount (get claimed-amount schedule))
+  )
+    (ok (if (> vested-amount claimed-amount) (- vested-amount claimed-amount) u0))
+  )
+)
+
+(define-read-only (get-schedule-status (beneficiary principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: beneficiary }) (err u0)))
+    (vested (unwrap! (calculate-vested-amount beneficiary) (err u0)))
+    (claimable (unwrap! (get-claimable-amount beneficiary) (err u0)))
+    (cliff-end (+ (get start-block schedule) (* (get cliff-duration-days schedule) BLOCKS_PER_DAY)))
+    (vesting-end (+ (get start-block schedule) (* (get vesting-duration-days schedule) BLOCKS_PER_DAY)))
+  )
+    (ok {
+      total-amount: (get total-amount schedule),
+      vested-amount: vested,
+      claimed-amount: (get claimed-amount schedule),
+      claimable-amount: claimable,
+      cliff-reached: (>= stacks-block-height cliff-end),
+      fully-vested: (>= stacks-block-height vesting-end),
+      revoked: (get revoked schedule)
+    })
+  )
+)
+
+(define-public (create-vesting-schedule 
+  (beneficiary principal) 
+  (amount uint) 
+  (cliff-days uint) 
+  (vesting-days uint)
+  (title (string-ascii 50))
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_PARAMS)
+    (asserts! (> vesting-days cliff-days) ERR_INVALID_PARAMS)
+    (asserts! (is-none (map-get? vesting-schedules { beneficiary: beneficiary })) ERR_SCHEDULE_EXISTS)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set vesting-schedules
+      { beneficiary: beneficiary }
+      {
+        total-amount: amount,
+        start-block: stacks-block-height,
+        cliff-duration-days: cliff-days,
+        vesting-duration-days: vesting-days,
+        claimed-amount: u0,
+        revoked: false,
+        revoke-block: u0
+      }
+    )
+    (map-set schedule-metadata
+      { beneficiary: beneficiary }
+      {
+        title: title,
+        created-block: stacks-block-height,
+        creator: tx-sender
+      }
+    )
+    (var-set total-locked (+ (var-get total-locked) amount))
+    (var-set total-schedules (+ (var-get total-schedules) u1))
+    (ok true)
+  )
+)
+
+(define-public (claim-vested-tokens)
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: tx-sender }) ERR_BENEFICIARY_NOT_FOUND))
+    (claimable (unwrap! (get-claimable-amount tx-sender) ERR_NOTHING_TO_CLAIM))
+  )
+    (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
+    (asserts! (> claimable u0) ERR_NOTHING_TO_CLAIM)
+    (try! (as-contract (stx-transfer? claimable tx-sender tx-sender)))
+    (map-set vesting-schedules
+      { beneficiary: tx-sender }
+      (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable) })
+    )
+    (var-set total-locked (- (var-get total-locked) claimable))
+    (ok claimable)
+  )
+)
+
+(define-public (revoke-vesting-schedule (beneficiary principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: beneficiary }) ERR_BENEFICIARY_NOT_FOUND))
+    (vested-amount (unwrap! (calculate-vested-amount beneficiary) ERR_INVALID_PARAMS))
+    (claimed-amount (get claimed-amount schedule))
+    (unvested-amount (- (get total-amount schedule) vested-amount))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
+    (map-set vesting-schedules
+      { beneficiary: beneficiary }
+      (merge schedule { 
+        revoked: true,
+        revoke-block: stacks-block-height
+      })
+    )
+    (if (> unvested-amount u0)
+      (begin
+        (try! (as-contract (stx-transfer? unvested-amount tx-sender CONTRACT_OWNER)))
+        (var-set total-locked (- (var-get total-locked) unvested-amount))
+        (ok unvested-amount)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (batch-create-schedules 
+  (schedules (list 20 {
+    beneficiary: principal,
+    amount: uint,
+    cliff-days: uint,
+    vesting-days: uint,
+    title: (string-ascii 50)
+  }))
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (ok (map create-single-schedule schedules))
+  )
+)
+
+(define-private (create-single-schedule (schedule-data {
+  beneficiary: principal,
+  amount: uint,
+  cliff-days: uint,
+  vesting-days: uint,
+  title: (string-ascii 50)
+}))
+  (create-vesting-schedule
+    (get beneficiary schedule-data)
+    (get amount schedule-data)
+    (get cliff-days schedule-data)
+    (get vesting-days schedule-data)
+    (get title schedule-data)
+  )
+)
+
+(define-public (emergency-withdraw-funds)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (let ((balance (stx-get-balance (as-contract tx-sender))))
+      (try! (as-contract (stx-transfer? balance tx-sender CONTRACT_OWNER)))
+      (ok balance)
+    )
+  )
+)
