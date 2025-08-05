@@ -178,6 +178,31 @@
   )
 )
 
+(define-public (set-delegate (delegate principal) (can-claim-payouts bool) (can-claim-vesting bool))
+  (begin
+    (asserts! (not (is-eq tx-sender delegate)) ERR_INVALID_PARAMS)
+    (map-set user-delegates
+      { user: tx-sender }
+      { delegate: delegate, active: true }
+    )
+    (map-set delegate-permissions
+      { delegate: delegate, user: tx-sender }
+      { can-claim-payouts: can-claim-payouts, can-claim-vesting: can-claim-vesting }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegate)
+  (let ((delegation (unwrap! (map-get? user-delegates { user: tx-sender }) ERR_NOT_DELEGATE)))
+    (map-set user-delegates
+      { user: tx-sender }
+      (merge delegation { active: false })
+    )
+    (ok true)
+  )
+)
+
 (define-public (claim-payout (week uint))
   (let (
     (user-data (unwrap! (map-get? users { user: tx-sender }) ERR_USER_NOT_FOUND))
@@ -199,6 +224,37 @@
     )
     (map-set users
       { user: tx-sender }
+      (merge user-data { 
+        last-claimed-week: week,
+        total-claimed: (+ (get total-claimed user-data) payout-amount)
+      })
+    )
+    (ok payout-amount)
+  )
+)
+
+(define-public (delegate-claim-payout (user principal) (week uint))
+  (let (
+    (user-data (unwrap! (map-get? users { user: user }) ERR_USER_NOT_FOUND))
+    (weekly-data (unwrap! (map-get? weekly-pools { week: week }) ERR_POOL_EMPTY))
+    (payout-amount (unwrap! (calculate-user-payout user week) ERR_INVALID_AMOUNT))
+  )
+    (asserts! (is-authorized-delegate tx-sender user "payout") ERR_NOT_DELEGATE)
+    (asserts! (get active user-data) ERR_UNAUTHORIZED)
+    (asserts! (is-week-claimable week) ERR_TOO_EARLY)
+    (asserts! (is-none (map-get? user-weekly-claims { user: user, week: week })) ERR_ALREADY_CLAIMED)
+    (asserts! (>= (get total-amount weekly-data) (+ (get distributed weekly-data) payout-amount)) ERR_INSUFFICIENT_BALANCE)
+    (try! (as-contract (stx-transfer? payout-amount tx-sender user)))
+    (map-set user-weekly-claims
+      { user: user, week: week }
+      { claimed: true, amount: payout-amount }
+    )
+    (map-set weekly-pools
+      { week: week }
+      (merge weekly-data { distributed: (+ (get distributed weekly-data) payout-amount) })
+    )
+    (map-set users
+      { user: user }
       (merge user-data { 
         last-claimed-week: week,
         total-claimed: (+ (get total-claimed user-data) payout-amount)
@@ -232,6 +288,8 @@
 (define-constant ERR_CLIFF_NOT_REACHED (err u205))
 (define-constant ERR_NOTHING_TO_CLAIM (err u206))
 (define-constant ERR_SCHEDULE_REVOKED (err u207))
+(define-constant ERR_NOT_DELEGATE (err u208))
+(define-constant ERR_DELEGATE_EXISTS (err u209))
 
 (define-constant BLOCKS_PER_DAY u144)
 
@@ -260,6 +318,16 @@
   }
 )
 
+(define-map user-delegates
+  { user: principal }
+  { delegate: principal, active: bool }
+)
+
+(define-map delegate-permissions
+  { delegate: principal, user: principal }
+  { can-claim-payouts: bool, can-claim-vesting: bool }
+)
+
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
 )
@@ -278,6 +346,39 @@
 
 (define-read-only (get-schedule-metadata (beneficiary principal))
   (map-get? schedule-metadata { beneficiary: beneficiary })
+)
+
+(define-read-only (get-user-delegate (user principal))
+  (map-get? user-delegates { user: user })
+)
+
+(define-read-only (get-delegate-permissions (delegate principal) (user principal))
+  (map-get? delegate-permissions { delegate: delegate, user: user })
+)
+
+(define-read-only (is-authorized-delegate (delegate principal) (user principal) (action (string-ascii 20)))
+  (let (
+    (delegation (map-get? user-delegates { user: user }))
+    (permissions (map-get? delegate-permissions { delegate: delegate, user: user }))
+  )
+    (match delegation
+      del-data (and 
+        (get active del-data)
+        (is-eq (get delegate del-data) delegate)
+        (match permissions
+          perm-data (if (is-eq action "payout")
+            (get can-claim-payouts perm-data)
+            (if (is-eq action "vesting") 
+              (get can-claim-vesting perm-data)
+              false
+            )
+          )
+          false
+        )
+      )
+      false
+    )
+  )
 )
 
 (define-read-only (calculate-vested-amount (beneficiary principal))
@@ -388,6 +489,24 @@
     (try! (as-contract (stx-transfer? claimable tx-sender tx-sender)))
     (map-set vesting-schedules
       { beneficiary: tx-sender }
+      (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable) })
+    )
+    (var-set total-locked (- (var-get total-locked) claimable))
+    (ok claimable)
+  )
+)
+
+(define-public (delegate-claim-vested-tokens (user principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: user }) ERR_BENEFICIARY_NOT_FOUND))
+    (claimable (unwrap! (get-claimable-amount user) ERR_NOTHING_TO_CLAIM))
+  )
+    (asserts! (is-authorized-delegate tx-sender user "vesting") ERR_NOT_DELEGATE)
+    (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
+    (asserts! (> claimable u0) ERR_NOTHING_TO_CLAIM)
+    (try! (as-contract (stx-transfer? claimable tx-sender user)))
+    (map-set vesting-schedules
+      { beneficiary: user }
       (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable) })
     )
     (var-set total-locked (- (var-get total-locked) claimable))
