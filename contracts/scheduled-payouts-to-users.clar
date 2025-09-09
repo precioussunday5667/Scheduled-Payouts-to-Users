@@ -157,9 +157,30 @@
   )
 )
 
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) (err u300))
+    (var-set contract-paused true)
+    (var-set pause-timestamp stacks-block-height)
+    (ok true)
+  )
+)
+
+(define-public (resume-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (var-get contract-paused) (err u301))
+    (var-set contract-paused false)
+    (var-set pause-timestamp u0)
+    (ok true)
+  )
+)
+
 (define-public (fund-weekly-pool (amount uint))
   (let ((current-week-calc (calculate-current-week)))
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     (asserts! (> (var-get pool-start-block) u0) (err u109))
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -209,6 +230,7 @@
     (weekly-data (unwrap! (map-get? weekly-pools { week: week }) ERR_POOL_EMPTY))
     (payout-amount (unwrap! (calculate-user-payout tx-sender week) ERR_INVALID_AMOUNT))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (get active user-data) ERR_UNAUTHORIZED)
     (asserts! (is-week-claimable week) ERR_TOO_EARLY)
     (asserts! (is-none (map-get? user-weekly-claims { user: tx-sender, week: week })) ERR_ALREADY_CLAIMED)
@@ -239,6 +261,7 @@
     (weekly-data (unwrap! (map-get? weekly-pools { week: week }) ERR_POOL_EMPTY))
     (payout-amount (unwrap! (calculate-user-payout user week) ERR_INVALID_AMOUNT))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-authorized-delegate tx-sender user "payout") ERR_NOT_DELEGATE)
     (asserts! (get active user-data) ERR_UNAUTHORIZED)
     (asserts! (is-week-claimable week) ERR_TOO_EARLY)
@@ -290,11 +313,14 @@
 (define-constant ERR_SCHEDULE_REVOKED (err u207))
 (define-constant ERR_NOT_DELEGATE (err u208))
 (define-constant ERR_DELEGATE_EXISTS (err u209))
+(define-constant ERR_CONTRACT_PAUSED (err u210))
 
 (define-constant BLOCKS_PER_DAY u144)
 
 (define-data-var total-locked uint u0)
 (define-data-var total-schedules uint u0)
+(define-data-var contract-paused bool false)
+(define-data-var pause-timestamp uint u0)
 
 (define-map vesting-schedules
   { beneficiary: principal }
@@ -338,6 +364,22 @@
 
 (define-read-only (get-total-schedules)
   (var-get total-schedules)
+)
+
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-pause-timestamp)
+  (var-get pause-timestamp)
+)
+
+(define-read-only (get-pause-status)
+  {
+    paused: (var-get contract-paused),
+    pause-timestamp: (var-get pause-timestamp),
+    current-block: stacks-block-height
+  }
 )
 
 (define-read-only (get-vesting-schedule (beneficiary principal))
@@ -449,6 +491,7 @@
 )
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (> amount u0) ERR_INVALID_PARAMS)
     (asserts! (> vesting-days cliff-days) ERR_INVALID_PARAMS)
     (asserts! (is-none (map-get? vesting-schedules { beneficiary: beneficiary })) ERR_SCHEDULE_EXISTS)
@@ -484,6 +527,7 @@
     (schedule (unwrap! (map-get? vesting-schedules { beneficiary: tx-sender }) ERR_BENEFICIARY_NOT_FOUND))
     (claimable (unwrap! (get-claimable-amount tx-sender) ERR_NOTHING_TO_CLAIM))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
     (asserts! (> claimable u0) ERR_NOTHING_TO_CLAIM)
     (try! (as-contract (stx-transfer? claimable tx-sender tx-sender)))
@@ -501,6 +545,7 @@
     (schedule (unwrap! (map-get? vesting-schedules { beneficiary: user }) ERR_BENEFICIARY_NOT_FOUND))
     (claimable (unwrap! (get-claimable-amount user) ERR_NOTHING_TO_CLAIM))
   )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
     (asserts! (is-authorized-delegate tx-sender user "vesting") ERR_NOT_DELEGATE)
     (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
     (asserts! (> claimable u0) ERR_NOTHING_TO_CLAIM)
