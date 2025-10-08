@@ -314,6 +314,9 @@
 (define-constant ERR_NOT_DELEGATE (err u208))
 (define-constant ERR_DELEGATE_EXISTS (err u209))
 (define-constant ERR_CONTRACT_PAUSED (err u210))
+(define-constant ERR_TRANSFER_NOT_FOUND (err u211))
+(define-constant ERR_TRANSFER_EXISTS (err u212))
+(define-constant ERR_SAME_BENEFICIARY (err u213))
 
 (define-constant BLOCKS_PER_DAY u144)
 
@@ -354,6 +357,11 @@
   { can-claim-payouts: bool, can-claim-vesting: bool }
 )
 
+(define-map vesting-transfer-proposals
+  { from-beneficiary: principal }
+  { to-beneficiary: principal, proposed-at-block: uint }
+)
+
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
 )
@@ -388,6 +396,10 @@
 
 (define-read-only (get-schedule-metadata (beneficiary principal))
   (map-get? schedule-metadata { beneficiary: beneficiary })
+)
+
+(define-read-only (get-transfer-proposal (from-beneficiary principal))
+  (map-get? vesting-transfer-proposals { from-beneficiary: from-beneficiary })
 )
 
 (define-read-only (get-user-delegate (user principal))
@@ -583,6 +595,55 @@
       )
       (ok u0)
     )
+  )
+)
+
+(define-public (propose-vesting-transfer (new-beneficiary principal))
+  (let (
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: tx-sender }) ERR_BENEFICIARY_NOT_FOUND))
+  )
+    (asserts! (not (is-eq tx-sender new-beneficiary)) ERR_SAME_BENEFICIARY)
+    (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
+    (asserts! (is-none (map-get? vesting-schedules { beneficiary: new-beneficiary })) ERR_SCHEDULE_EXISTS)
+    (asserts! (is-none (map-get? vesting-transfer-proposals { from-beneficiary: tx-sender })) ERR_TRANSFER_EXISTS)
+    (map-set vesting-transfer-proposals
+      { from-beneficiary: tx-sender }
+      { to-beneficiary: new-beneficiary, proposed-at-block: stacks-block-height }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-vesting-transfer (from-beneficiary principal))
+  (let (
+    (proposal (unwrap! (map-get? vesting-transfer-proposals { from-beneficiary: from-beneficiary }) ERR_TRANSFER_NOT_FOUND))
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: from-beneficiary }) ERR_BENEFICIARY_NOT_FOUND))
+    (metadata (unwrap! (map-get? schedule-metadata { beneficiary: from-beneficiary }) ERR_BENEFICIARY_NOT_FOUND))
+    (to-beneficiary (get to-beneficiary proposal))
+  )
+    (asserts! (is-eq tx-sender to-beneficiary) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? vesting-schedules { beneficiary: tx-sender })) ERR_SCHEDULE_EXISTS)
+    (map-set vesting-schedules
+      { beneficiary: tx-sender }
+      schedule
+    )
+    (map-set schedule-metadata
+      { beneficiary: tx-sender }
+      metadata
+    )
+    (map-delete vesting-schedules { beneficiary: from-beneficiary })
+    (map-delete schedule-metadata { beneficiary: from-beneficiary })
+    (map-delete vesting-transfer-proposals { from-beneficiary: from-beneficiary })
+    (ok true)
+  )
+)
+
+(define-public (cancel-vesting-transfer)
+  (let (
+    (proposal (unwrap! (map-get? vesting-transfer-proposals { from-beneficiary: tx-sender }) ERR_TRANSFER_NOT_FOUND))
+  )
+    (map-delete vesting-transfer-proposals { from-beneficiary: tx-sender })
+    (ok true)
   )
 )
 
