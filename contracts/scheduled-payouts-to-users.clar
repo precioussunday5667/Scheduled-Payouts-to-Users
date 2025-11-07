@@ -687,3 +687,95 @@
     )
   )
 )
+
+(define-constant ERR_FEE_NOT_SET (err u214))
+
+(define-data-var fee-bps uint u0)
+(define-data-var fee-recipient (optional principal) none)
+
+(define-read-only (get-fee-config)
+  { bps: (var-get fee-bps), recipient: (var-get fee-recipient) }
+)
+
+(define-public (configure-fee (bps uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= bps u10000) ERR_INVALID_PARAMS)
+    (var-set fee-bps bps)
+    (var-set fee-recipient (some recipient))
+    (ok true)
+  )
+)
+
+(define-public (claim-payout-with-fee (week uint))
+  (let (
+    (caller tx-sender)
+    (user-data (unwrap! (map-get? users { user: caller }) ERR_USER_NOT_FOUND))
+    (weekly-data (unwrap! (map-get? weekly-pools { week: week }) ERR_POOL_EMPTY))
+    (payout-amount (unwrap! (calculate-user-payout caller week) ERR_INVALID_AMOUNT))
+    (bps (var-get fee-bps))
+    (recipient-opt (var-get fee-recipient))
+    (fee (if (> bps u0) (/ (* payout-amount bps) u10000) u0))
+    (net (- payout-amount fee))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (get active user-data) ERR_UNAUTHORIZED)
+    (asserts! (is-week-claimable week) ERR_TOO_EARLY)
+    (asserts! (is-none (map-get? user-weekly-claims { user: caller, week: week })) ERR_ALREADY_CLAIMED)
+    (asserts! (>= (get total-amount weekly-data) (+ (get distributed weekly-data) payout-amount)) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (or (is-eq bps u0) (not (is-none recipient-opt))) ERR_FEE_NOT_SET)
+    (try! (as-contract (stx-transfer? net tx-sender caller)))
+    (if (not (is-none recipient-opt))
+      (let ((r (unwrap! recipient-opt ERR_FEE_NOT_SET)))
+        (try! (as-contract (stx-transfer? fee tx-sender r)))
+      )
+      true
+    )
+    (map-set user-weekly-claims
+      { user: caller, week: week }
+      { claimed: true, amount: payout-amount }
+    )
+    (map-set weekly-pools
+      { week: week }
+      (merge weekly-data { distributed: (+ (get distributed weekly-data) payout-amount) })
+    )
+    (map-set users
+      { user: caller }
+      (merge user-data { 
+        last-claimed-week: week,
+        total-claimed: (+ (get total-claimed user-data) payout-amount)
+      })
+    )
+    (ok payout-amount)
+  )
+)
+
+(define-public (claim-vested-with-fee)
+  (let (
+    (caller tx-sender)
+    (schedule (unwrap! (map-get? vesting-schedules { beneficiary: caller }) ERR_BENEFICIARY_NOT_FOUND))
+    (claimable (unwrap! (get-claimable-amount caller) ERR_NOTHING_TO_CLAIM))
+    (bps (var-get fee-bps))
+    (recipient-opt (var-get fee-recipient))
+    (fee (if (> bps u0) (/ (* claimable bps) u10000) u0))
+    (net (- claimable fee))
+  )
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (not (get revoked schedule)) ERR_SCHEDULE_REVOKED)
+    (asserts! (> claimable u0) ERR_NOTHING_TO_CLAIM)
+    (asserts! (or (is-eq bps u0) (not (is-none recipient-opt))) ERR_FEE_NOT_SET)
+    (try! (as-contract (stx-transfer? net tx-sender caller)))
+    (if (not (is-none recipient-opt))
+      (let ((r (unwrap! recipient-opt ERR_FEE_NOT_SET)))
+        (try! (as-contract (stx-transfer? fee tx-sender r)))
+      )
+      true
+    )
+    (map-set vesting-schedules
+      { beneficiary: caller }
+      (merge schedule { claimed-amount: (+ (get claimed-amount schedule) claimable) })
+    )
+    (var-set total-locked (- (var-get total-locked) claimable))
+    (ok claimable)
+  )
+)
